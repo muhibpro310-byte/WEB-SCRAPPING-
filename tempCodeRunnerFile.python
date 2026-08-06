@@ -1,0 +1,468 @@
+from pathlib import Path
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+
+# =========================================================
+# WEBSITE AND FILE SETTINGS
+# =========================================================
+
+START_URL = "https://books.toscrape.com/"
+
+# Use None to scrape every available page.
+# Use a number such as 5 to scrape only five pages.
+MAX_PAGES = None
+
+# Excel file will be created beside this Python script.
+OUTPUT_FILE = Path(__file__).resolve().with_name(
+    "books_scraped_data.xlsx"
+)
+
+
+# =========================================================
+# STAR-RATING CONVERSION
+# =========================================================
+
+RATING_VALUES = {
+    "One": 1,
+    "Two": 2,
+    "Three": 3,
+    "Four": 4,
+    "Five": 5
+}
+
+
+# =========================================================
+# CREATE CHROME DRIVER
+# =========================================================
+
+chrome_options = webdriver.ChromeOptions()
+
+chrome_options.add_argument("--start-maximized")
+chrome_options.add_argument("--disable-notifications")
+
+# Reduce unnecessary Chrome messages in the terminal.
+chrome_options.add_experimental_option(
+    "excludeSwitches",
+    ["enable-logging"]
+)
+
+# Uncomment the following line to run without opening Chrome.
+# chrome_options.add_argument("--headless=new")
+
+driver = webdriver.Chrome(options=chrome_options)
+
+wait = WebDriverWait(driver, 20)
+
+
+# =========================================================
+# STORAGE FOR SCRAPED DATA
+# =========================================================
+
+all_books = []
+
+
+try:
+    print("Opening Books to Scrape...")
+
+    current_url = START_URL
+    page_number = 1
+    serial_number = 1
+
+    while current_url:
+
+        # Stop when the selected page limit is reached.
+        if MAX_PAGES is not None and page_number > MAX_PAGES:
+            print(f"\nPage limit of {MAX_PAGES} reached.")
+            break
+
+        print(f"\nScraping page {page_number}...")
+        print(f"URL: {current_url}")
+
+        driver.get(current_url)
+
+        # Wait until the product cards are present.
+        wait.until(
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR, "article.product_pod")
+            )
+        )
+
+        # Get the fully loaded HTML.
+        html = driver.page_source
+
+        # Parse the page using BeautifulSoup.
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Find every book card.
+        book_cards = soup.select("article.product_pod")
+
+        print(f"Books found: {len(book_cards)}")
+
+        # -------------------------------------------------
+        # EXTRACT INFORMATION FROM EACH BOOK
+        # -------------------------------------------------
+
+        for book in book_cards:
+
+            # Book title and product link
+            title_element = book.select_one("h3 a")
+
+            if title_element:
+                title = title_element.get(
+                    "title",
+                    title_element.get_text(strip=True)
+                )
+
+                product_url = urljoin(
+                    current_url,
+                    title_element.get("href", "")
+                )
+            else:
+                title = "Not available"
+                product_url = "Not available"
+
+            # Book price
+            price_element = book.select_one("p.price_color")
+
+            if price_element:
+                price_text = price_element.get_text(strip=True)
+
+                try:
+                    price = float(
+                        price_text
+                        .replace("£", "")
+                        .replace("Â", "")
+                        .strip()
+                    )
+                except ValueError:
+                    price = None
+            else:
+                price = None
+
+            # Availability
+            availability_element = book.select_one(
+                "p.instock.availability"
+            )
+
+            availability = (
+                availability_element.get_text(
+                    " ",
+                    strip=True
+                )
+                if availability_element
+                else "Not available"
+            )
+
+            # Rating
+            rating_element = book.select_one("p.star-rating")
+
+            rating_word = "Not available"
+            rating_number = None
+
+            if rating_element:
+                rating_classes = rating_element.get(
+                    "class",
+                    []
+                )
+
+                for class_name in rating_classes:
+                    if class_name in RATING_VALUES:
+                        rating_word = class_name
+                        rating_number = RATING_VALUES[class_name]
+                        break
+
+            # Image link
+            image_element = book.select_one("img.thumbnail")
+
+            if image_element:
+                image_url = urljoin(
+                    current_url,
+                    image_element.get("src", "")
+                )
+            else:
+                image_url = "Not available"
+
+            # Store one complete record.
+            record = {
+                "Serial Number": serial_number,
+                "Title": title,
+                "Price GBP": price,
+                "Availability": availability,
+                "Rating": rating_number,
+                "Rating Text": rating_word,
+                "Product URL": product_url,
+                "Image URL": image_url,
+                "Page Number": page_number
+            }
+
+            all_books.append(record)
+
+            print(
+                f"{serial_number}. {title} "
+                f"| £{price if price is not None else 'N/A'}"
+            )
+
+            serial_number += 1
+
+        # -------------------------------------------------
+        # FIND THE NEXT PAGE
+        # -------------------------------------------------
+
+        next_button = soup.select_one("li.next a")
+
+        if next_button:
+            next_page_href = next_button.get("href")
+
+            current_url = urljoin(
+                current_url,
+                next_page_href
+            )
+
+            page_number += 1
+
+        else:
+            print("\nNo next page found.")
+            print("All available pages have been scraped.")
+            current_url = None
+
+
+except TimeoutException:
+    print("\nThe website took too long to load.")
+    print("Check your internet connection and try again.")
+
+except Exception as error:
+    print(f"\nScraping error: {error}")
+
+finally:
+    print("\nClosing Chrome...")
+    driver.quit()
+
+
+# =========================================================
+# CREATE EXCEL FILE
+# =========================================================
+
+if all_books:
+
+    print("\nCreating Excel file...")
+
+    workbook = Workbook()
+
+    worksheet = workbook.active
+    worksheet.title = "Scraped Books"
+
+    headers = [
+        "Serial Number",
+        "Title",
+        "Price GBP",
+        "Availability",
+        "Rating",
+        "Rating Text",
+        "Product URL",
+        "Image URL",
+        "Page Number"
+    ]
+
+    # Add column headings.
+    worksheet.append(headers)
+
+    # Add scraped records.
+    for book in all_books:
+
+        worksheet.append([
+            book["Serial Number"],
+            book["Title"],
+            book["Price GBP"],
+            book["Availability"],
+            book["Rating"],
+            book["Rating Text"],
+            book["Product URL"],
+            book["Image URL"],
+            book["Page Number"]
+        ])
+
+
+    # =====================================================
+    # FORMAT THE EXCEL WORKSHEET
+    # =====================================================
+
+    header_fill = PatternFill(
+        fill_type="solid",
+        fgColor="1F4E78"
+    )
+
+    header_font = Font(
+        color="FFFFFF",
+        bold=True
+    )
+
+    # Format header row.
+    for cell in worksheet[1]:
+
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center"
+        )
+
+    worksheet.row_dimensions[1].height = 25
+
+    # Freeze the header row.
+    worksheet.freeze_panes = "A2"
+
+    # Add filters and table styling.
+    last_row = worksheet.max_row
+
+    excel_table = Table(
+        displayName="BooksTable",
+        ref=f"A1:I{last_row}"
+    )
+
+    table_style = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False
+    )
+
+    excel_table.tableStyleInfo = table_style
+    worksheet.add_table(excel_table)
+
+    # Set sensible column widths.
+    column_widths = {
+        "A": 15,
+        "B": 55,
+        "C": 14,
+        "D": 20,
+        "E": 10,
+        "F": 14,
+        "G": 55,
+        "H": 55,
+        "I": 14
+    }
+
+    for column, width in column_widths.items():
+        worksheet.column_dimensions[column].width = width
+
+    # Format data cells.
+    for row_number in range(2, worksheet.max_row + 1):
+
+        # Price formatting
+        price_cell = worksheet[f"C{row_number}"]
+
+        if price_cell.value is not None:
+            price_cell.number_format = '£0.00'
+
+        # Centre selected columns.
+        for column in ["A", "C", "E", "F", "I"]:
+
+            worksheet[f"{column}{row_number}"].alignment = Alignment(
+                horizontal="center",
+                vertical="center"
+            )
+
+        # Wrap long text.
+        for column in ["B", "D", "G", "H"]:
+
+            worksheet[f"{column}{row_number}"].alignment = Alignment(
+                vertical="top",
+                wrap_text=True
+            )
+
+        # Make product URL clickable.
+        product_url_cell = worksheet[f"G{row_number}"]
+
+        if (
+            product_url_cell.value
+            and product_url_cell.value != "Not available"
+        ):
+            product_url_cell.hyperlink = product_url_cell.value
+            product_url_cell.style = "Hyperlink"
+
+        # Make image URL clickable.
+        image_url_cell = worksheet[f"H{row_number}"]
+
+        if (
+            image_url_cell.value
+            and image_url_cell.value != "Not available"
+        ):
+            image_url_cell.hyperlink = image_url_cell.value
+            image_url_cell.style = "Hyperlink"
+
+    # Create a summary worksheet.
+    summary_sheet = workbook.create_sheet("Summary")
+
+    summary_sheet["A1"] = "Web Scraping Summary"
+    summary_sheet["A1"].font = Font(
+        bold=True,
+        size=16,
+        color="FFFFFF"
+    )
+    summary_sheet["A1"].fill = header_fill
+
+    summary_sheet["A3"] = "Website"
+    summary_sheet["B3"] = START_URL
+
+    summary_sheet["A4"] = "Total books scraped"
+    summary_sheet["B4"] = len(all_books)
+
+    summary_sheet["A5"] = "Total pages scraped"
+    summary_sheet["B5"] = max(
+        book["Page Number"]
+        for book in all_books
+    )
+
+    summary_sheet["A6"] = "Excel file"
+    summary_sheet["B6"] = OUTPUT_FILE.name
+
+    summary_sheet["A8"] = "Average book price"
+
+    # Excel formula calculates average dynamically.
+    summary_sheet["B8"] = (
+        "=AVERAGE('Scraped Books'!C2:"
+        f"C{worksheet.max_row})"
+    )
+    summary_sheet["B8"].number_format = '£0.00'
+
+    summary_sheet["A9"] = "Highest book price"
+    summary_sheet["B9"] = (
+        "=MAX('Scraped Books'!C2:"
+        f"C{worksheet.max_row})"
+    )
+    summary_sheet["B9"].number_format = '£0.00'
+
+    summary_sheet["A10"] = "Lowest book price"
+    summary_sheet["B10"] = (
+        "=MIN('Scraped Books'!C2:"
+        f"C{worksheet.max_row})"
+    )
+    summary_sheet["B10"].number_format = '£0.00'
+
+    summary_sheet.column_dimensions["A"].width = 25
+    summary_sheet.column_dimensions["B"].width = 50
+
+    for cell in summary_sheet["A"]:
+        cell.font = Font(bold=True)
+
+    # Save the completed Excel workbook.
+    workbook.save(OUTPUT_FILE)
+
+    print("\nScraping completed successfully.")
+    print(f"Total books scraped: {len(all_books)}")
+    print(f"Excel file saved at:\n{OUTPUT_FILE}")
+
+else:
+    print("\nNo information was scraped.")
+    print("The Excel file was not created.")
